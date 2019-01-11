@@ -27,7 +27,7 @@ class NMF_Base(object):
         self.default_max_iter = default_max_iter
         self.default_max_time = default_max_time
 
-    def run(self, A, k, init=None, max_iter=None, max_time=None, verbose=0):
+    def run(self, A, k, init=None, reg_w=(0.0, 0.0), reg_h=(0.0, 0.0), max_iter=None, max_time=None, verbose=0):
         """ Run a NMF algorithm
 
         Parameters
@@ -75,6 +75,7 @@ class NMF_Base(object):
         else:
             W = random.rand(A.shape[0], k)
             H = random.rand(A.shape[1], k)
+
             info['init'] = 'uniform_random'
 
         if verbose >= 0:
@@ -94,7 +95,7 @@ class NMF_Base(object):
         for i in range(1, info['max_iter'] + 1):
             start_iter = time.time()
             # algorithm-specific iteration solver
-            (W, H) = self.iter_solver(A, W, H, k, i)
+            (W, H) = self.iter_solver(A, W, H, k, i, reg_w, reg_h)
             elapsed = time.time() - start_iter
 
             if verbose >= 1:
@@ -172,7 +173,18 @@ class NMF_Base(object):
             print (json.dumps(best[2]['final'], indent=4, sort_keys=True))
         return best
 
-    def iter_solver(self, A, W, H, k, it):
+    def apply_reg(self, AtA, k, reg):
+        # Frobenius norm regularization
+        if reg[0] > 0:
+            AtA = AtA + 2 * reg[0] * np.eye(k)
+
+        # L1-norm regularization
+        if reg[1] > 0:
+            AtA = AtA + 2 * reg[1] * np.ones((k,k))
+
+        return AtA
+
+    def iter_solver(self, A, W, H, k, it, reg_w, reg_h):
         raise NotImplementedError
 
     def initializer(self, W, H):
@@ -191,11 +203,34 @@ class NMF_ANLS_BLOCKPIVOT(NMF_Base):
     def __init__(self, default_max_iter=50, default_max_time=np.inf):
         self.set_default(default_max_iter, default_max_time)
 
-    def iter_solver(self, A, W, H, k, it):
-        Sol, info = nnlsm_blockpivot(W, A, init=H.T)
+    def iter_solver(self, A, W, H, k, it, reg_w=(0.0, 0.0), reg_h=(0.0, 0.0)):
+
+        if not hasattr(self, 'WtW'):
+            self.WtW = W.T.dot(W)
+
+        if not hasattr(self, 'WtA'):
+            if sps.issparse(A):
+                self.WtA = A.T.dot(W)
+                self.WtA = self.WtA.T
+            else:
+                self.WtA = W.T.dot(A)
+
+        WtW_reg = self.apply_reg(self.WtW, k, reg_h)
+        Sol, info = nnlsm_blockpivot(WtW_reg, self.WtA, is_input_prod=True, init=H.T)
         H = Sol.T
-        Sol, info = nnlsm_blockpivot(H, A.T, init=W.T)
+
+        HtH_reg = self.apply_reg(H.T.dot(H), k, reg_w)
+        Sol, info = nnlsm_blockpivot(HtH_reg, A.dot(H).T, is_input_prod=True, init=W.T)
         W = Sol.T
+
+        self.WtA = A.T.dot(W)
+        self.WtA = self.WtA.T
+        self.WtW = W.T.dot(W)
+
+        # Sol, info = nnlsm_blockpivot(W, A, init=H.T)
+        # H = Sol.T
+        # Sol, info = nnlsm_blockpivot(H, A.T, init=W.T)
+        # W = Sol.T
         return (W, H)
 
 
@@ -271,17 +306,21 @@ class NMF_HALS(NMF_Base):
         W, H, weights = mu.normalize_column_pair(W, H)
         return W, H
 
-    def iter_solver(self, A, W, H, k, it):
+    def iter_solver(self, A, W, H, k, it, reg_w=(0.0, 0.0), reg_h=(0.0, 0.0)):
         AtW = A.T.dot(W)
         WtW = W.T.dot(W)
+        WtW_reg = self.apply_reg(WtW, k, reg_h)
+
         for kk in iter(range(0, k)):
-            temp_vec = H[:, kk] + AtW[:, kk] - H.dot(WtW[:, kk])
+            temp_vec = H[:, kk] + AtW[:, kk] - H.dot(WtW_reg[:, kk])
             H[:, kk] = np.maximum(temp_vec, self.eps)
 
         AH = A.dot(H)
         HtH = H.T.dot(H)
+        HtH_reg = self.apply_reg(HtH, k, reg_w)
+
         for kk in iter(range(0, k)):
-            temp_vec = W[:, kk] * HtH[kk, kk] + AH[:, kk] - W.dot(HtH[:, kk])
+            temp_vec = W[:, kk] * HtH_reg[kk, kk] + AH[:, kk] - W.dot(HtH_reg[:, kk])
             W[:, kk] = np.maximum(temp_vec, self.eps)
             ss = nla.norm(W[:, kk])
             if ss > 0:
